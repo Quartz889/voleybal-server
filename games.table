@@ -1,0 +1,8 @@
+[teams]
+0=beans
+1=toast
+2=cream
+[/]
+[games]
+#id, team1, team2, score1, score2, score3, eval
+0,0,1,52x67x441,24563x324,342x45,1
