@@ -156,10 +156,9 @@ def generate_playoffs(path, teams_list, current_games):
     if n < 2:
         return current_games
 
-    # Round up to the nearest power of 2 for a clean bracket
     bracket_size = 2 ** math.ceil(math.log2(n))
 
-    # 1. Calculate Standings from robin phase
+    # 1. Standings
     standings = {str(t["id"]): 0 for t in teams_list}
     for g in current_games:
         if (g.get("phase") == "robin" or not g.get("phase")) and "x" in str(g.get("score1", "")):
@@ -169,20 +168,17 @@ def generate_playoffs(path, teams_list, current_games):
                 elif s2 > s1: standings[str(g["team2"])] += 1
             except: continue
 
-    # Seed teams by wins, pad with "BYE" up to bracket_size
     sorted_ids = sorted(standings, key=standings.get, reverse=True)
     seeds = sorted_ids + ["BYE"] * (bracket_size - len(sorted_ids))
 
-    # 2. Map existing playoff games for score preservation
+    # 2. Map existing games
     playoff_map = {
         g.get("eval", "").lower().strip(): g
         for g in current_games if g.get("phase") == "playoffs"
     }
 
     def get_winner(label):
-        target = next(
-            (g for lbl, g in playoff_map.items() if label.lower() in lbl), None
-        )
+        target = next((g for lbl, g in playoff_map.items() if label.lower() in lbl), None)
         if not target or "x" not in str(target.get("score1", "")):
             return "TBD"
         try:
@@ -192,19 +188,16 @@ def generate_playoffs(path, teams_list, current_games):
             return "TBD"
 
     def get_loser(label):
-        target = next(
-            (g for lbl, g in playoff_map.items() if label.lower() in lbl), None
-        )
+        target = next((g for lbl, g in playoff_map.items() if label.lower() in lbl), None)
         if not target or "x" not in str(target.get("score1", "")):
             return "TBD"
         try:
             s1, s2 = map(int, target["score1"].split('x'))
-            # loser is the team that won fewer sets
             return str(target["team2"]) if s1 > s2 else str(target["team1"])
         except:
             return "TBD"
 
-    # 3. Build bracket rounds dynamically
+    # 3. Main bracket
     ROUND_NAMES = {
         2:  ["Finalas"],
         4:  ["Pusfinalis {i}", "Finalas"],
@@ -218,67 +211,115 @@ def generate_playoffs(path, teams_list, current_games):
     )
 
     playoff_structure = []
+    round_game_objects = []
 
-    # First round: seed matchups using standard bracket seeding
-    first_round_size = bracket_size // 2
+    # First round
     first_round_label = round_templates[0]
     first_round_games = []
     lo, hi = 0, bracket_size - 1
-    for i in range(first_round_size):
+    for i in range(bracket_size // 2):
         t1, t2 = seeds[lo], seeds[hi]
-        lo += 1
-        hi -= 1
-        label = first_round_label.replace("{i}", str(i + 1)) if "{i}" in first_round_label else first_round_label
+        lo += 1; hi -= 1
+        label = first_round_label.replace("{i}", str(i+1)) if "{i}" in first_round_label else first_round_label
         first_round_games.append({"eval": label, "t1": t1, "t2": t2})
-
     playoff_structure.extend(first_round_games)
+    round_game_objects.append(first_round_games)
 
-    # Subsequent rounds
     prev_labels = [g["eval"] for g in first_round_games]
     semifinal_labels = []
 
     for round_idx in range(1, len(round_templates)):
         label_template = round_templates[round_idx]
         next_labels = []
-        games_this_round = len(prev_labels) // 2
-
-        for i in range(games_this_round):
-            w1 = get_winner(prev_labels[i * 2])
-            w2 = get_winner(prev_labels[i * 2 + 1])
-            label = (
-                label_template.replace("{i}", str(i + 1))
-                if "{i}" in label_template else label_template
-            )
-            playoff_structure.append({"eval": label, "t1": w1, "t2": w2})
+        round_games = []
+        for i in range(len(prev_labels) // 2):
+            w1 = get_winner(prev_labels[i*2])
+            w2 = get_winner(prev_labels[i*2+1])
+            label = label_template.replace("{i}", str(i+1)) if "{i}" in label_template else label_template
+            game = {"eval": label, "t1": w1, "t2": w2}
+            round_games.append(game)
+            playoff_structure.append(game)
             next_labels.append(label)
+        round_game_objects.append(round_games)
 
-        # Capture semifinal labels (second‑to‑last round)
         if round_idx == len(round_templates) - 2:
             semifinal_labels = next_labels.copy()
-
         prev_labels = next_labels
 
-    # Add third‑place match (losers of the two semifinals) BEFORE the final
+    # Third place
     if semifinal_labels and len(semifinal_labels) >= 2:
-        loser1 = get_loser(semifinal_labels[0])
-        loser2 = get_loser(semifinal_labels[1])
-        third_place_game = {
+        playoff_structure.insert(-1, {
             "eval": "Dėl 3 vietos",
-            "t1": loser1,
-            "t2": loser2
-        }
-        playoff_structure.insert(-1, third_place_game)   # insert before the last game (final)
+            "t1": get_loser(semifinal_labels[0]),
+            "t2": get_loser(semifinal_labels[1])
+        })
 
-    # 4. Merge with existing games, preserving scores
+    # --- Helper to add a full classification bracket for a group of losers ---
+    def add_class_bracket(losers, rank_start):
+        L = len(losers)
+        if L < 2:
+            return
+        prefix = f"Kova dėl {rank_start}-{rank_start + L - 1} vietų"
+        # Mini round templates (same as main bracket)
+        MINI = {
+            2: ["Finalas"],
+            4: ["Pusfinalis {i}", "Finalas"],
+            8: ["Ketvirtfinalis {i}", "Pusfinalis {i}", "Finalas"],
+            16: ["1/8 Final {i}", "Ketvirtfinalis {i}", "Pusfinalis {i}", "Finalas"],
+        }
+        mini = MINI.get(L, [f"R{x+1} {{i}}" for x in range(int(math.log2(L))-1)] + ["Finalas"])
+
+        # 1st round
+        lbl0 = mini[0]
+        cur_lbls = []
+        for i in range(0, L, 2):
+            lbl = lbl0.replace("{i}", str(i//2+1)) if "{i}" in lbl0 else lbl0
+            full = f"{prefix} {lbl}"
+            playoff_structure.append({"eval": full, "t1": losers[i], "t2": losers[i+1]})
+            cur_lbls.append(full)
+
+        # Subsequent rounds
+        semi_lbls = []
+        for cr in range(1, len(mini)):
+            tmpl = mini[cr]
+            nxt = []
+            for i in range(len(cur_lbls)//2):
+                w1 = get_winner(cur_lbls[i*2])
+                w2 = get_winner(cur_lbls[i*2+1])
+                lbl = tmpl.replace("{i}", str(i+1)) if "{i}" in tmpl else tmpl
+                full = f"{prefix} {lbl}"
+                playoff_structure.append({"eval": full, "t1": w1, "t2": w2})
+                nxt.append(full)
+            if cr == len(mini) - 2:   # semi‑final round
+                semi_lbls = cur_lbls.copy()
+            cur_lbls = nxt
+
+        # Third place match for the group (if at least 4 teams)
+        if L >= 4 and semi_lbls and len(semi_lbls) == 2:
+            l1 = get_loser(semi_lbls[0])
+            l2 = get_loser(semi_lbls[1])
+            third_lbl = f"{prefix} Dėl {rank_start+2} vietos"
+            playoff_structure.append({"eval": third_lbl, "t1": l1, "t2": l2})
+
+    # --- Generate classification brackets ---
+    num_rounds = len(round_templates)
+    for r in range(num_rounds - 2):   # all rounds before semifinals
+        games = round_game_objects[r]
+        losers = []
+        for g in games:
+            if g["t1"] != "BYE" and g["t2"] != "BYE":
+                losers.append(get_loser(g["eval"]))
+        if len(losers) >= 2:
+            rank_start = 2 ** (num_rounds - r - 1) + 1
+            add_class_bracket(losers, rank_start)
+
+    # 4. Merge with existing games
     new_list = [g for g in current_games if g.get("phase") != "playoffs"]
     start_id = len(new_list)
 
     for i, m in enumerate(playoff_structure):
-        existing = next(
-            (g for lbl, g in playoff_map.items() if m["eval"].lower() in lbl), {}
-        )
+        existing = next((g for lbl, g in playoff_map.items() if m["eval"].lower() in lbl), {})
         t1, t2 = m["t1"], m["t2"]
-        # Auto-advance if one side is a BYE
         if t1 == "BYE":
             t1 = t2 = t2
         elif t2 == "BYE":
