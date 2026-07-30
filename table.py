@@ -158,7 +158,7 @@ def generate_playoffs(path, teams_list, current_games):
 
     bracket_size = 2 ** math.ceil(math.log2(n))
 
-    # 1. Standings
+    # 1. Standings from robin phase
     standings = {str(t["id"]): 0 for t in teams_list}
     for g in current_games:
         if (g.get("phase") == "robin" or not g.get("phase")) and "x" in str(g.get("score1", "")):
@@ -171,7 +171,7 @@ def generate_playoffs(path, teams_list, current_games):
     sorted_ids = sorted(standings, key=standings.get, reverse=True)
     seeds = sorted_ids + ["BYE"] * (bracket_size - len(sorted_ids))
 
-    # 2. Map existing games
+    # 2. Map existing playoff games
     playoff_map = {
         g.get("eval", "").lower().strip(): g
         for g in current_games if g.get("phase") == "playoffs"
@@ -212,6 +212,7 @@ def generate_playoffs(path, teams_list, current_games):
 
     playoff_structure = []
     round_game_objects = []
+    classification_games = []   # will be inserted before the final
 
     # First round
     first_round_label = round_templates[0]
@@ -246,21 +247,23 @@ def generate_playoffs(path, teams_list, current_games):
             semifinal_labels = next_labels.copy()
         prev_labels = next_labels
 
-    # Third place
+    # Third place match (insert before the final)
     if semifinal_labels and len(semifinal_labels) >= 2:
-        playoff_structure.insert(-1, {
+        third_place_game = {
             "eval": "Dėl 3 vietos",
             "t1": get_loser(semifinal_labels[0]),
             "t2": get_loser(semifinal_labels[1])
-        })
+        }
+        playoff_structure.insert(-1, third_place_game)
 
     # --- Helper to add a full classification bracket for a group of losers ---
-    def add_class_bracket(losers, rank_start):
+    def add_class_bracket(losers, rank_start, is_last_pool=False):
         L = len(losers)
         if L < 2:
             return
         prefix = f"Kova dėl {rank_start}-{rank_start + L - 1} vietų"
-        # Mini round templates (same as main bracket)
+
+        # Mini round templates
         MINI = {
             2: ["Finalas"],
             4: ["Pusfinalis {i}", "Finalas"],
@@ -269,17 +272,24 @@ def generate_playoffs(path, teams_list, current_games):
         }
         mini = MINI.get(L, [f"R{x+1} {{i}}" for x in range(int(math.log2(L))-1)] + ["Finalas"])
 
-        # 1st round
+        # First round (semi‑finals for L=4, quarter‑finals for L=8, etc.)
         lbl0 = mini[0]
         cur_lbls = []
         for i in range(0, L, 2):
             lbl = lbl0.replace("{i}", str(i//2+1)) if "{i}" in lbl0 else lbl0
             full = f"{prefix} {lbl}"
-            playoff_structure.append({"eval": full, "t1": losers[i], "t2": losers[i+1]})
+            classification_games.append({"eval": full, "t1": losers[i], "t2": losers[i+1]})
             cur_lbls.append(full)
 
-        # Subsequent rounds
+        # For L=4, the first round IS the semi‑final → capture its labels for the 3rd place game
         semi_lbls = []
+        if L == 4:
+            semi_lbls = cur_lbls.copy()
+        elif L >= 8:
+            # semi‑final labels will be captured inside the loop (the round before the final)
+            pass
+
+        # Subsequent rounds
         for cr in range(1, len(mini)):
             tmpl = mini[cr]
             nxt = []
@@ -288,22 +298,31 @@ def generate_playoffs(path, teams_list, current_games):
                 w2 = get_winner(cur_lbls[i*2+1])
                 lbl = tmpl.replace("{i}", str(i+1)) if "{i}" in tmpl else tmpl
                 full = f"{prefix} {lbl}"
-                playoff_structure.append({"eval": full, "t1": w1, "t2": w2})
+                classification_games.append({"eval": full, "t1": w1, "t2": w2})
                 nxt.append(full)
+            # If this was the round that created the semi‑finals (second‑last round), save them
             if cr == len(mini) - 2:   # semi‑final round
-                semi_lbls = cur_lbls.copy()
+                semi_lbls = nxt.copy()
             cur_lbls = nxt
 
-        # Third place match for the group (if at least 4 teams)
-        if L >= 4 and semi_lbls and len(semi_lbls) == 2:
+        # Third place / Last place match
+        if L == 2:
+            # The only game already determines last place; rename it
+            if is_last_pool:
+                classification_games[-1]["eval"] = "Dėl paskutinės vietos"
+        elif L >= 4 and semi_lbls and len(semi_lbls) == 2:
             l1 = get_loser(semi_lbls[0])
             l2 = get_loser(semi_lbls[1])
-            third_lbl = f"{prefix} Dėl {rank_start+2} vietos"
-            playoff_structure.append({"eval": third_lbl, "t1": l1, "t2": l2})
+            if is_last_pool:
+                third_lbl = "Dėl paskutinės vietos"
+            else:
+                third_lbl = f"{prefix} Dėl {rank_start+2} vietos"
+            classification_games.append({"eval": third_lbl, "t1": l1, "t2": l2})
 
     # --- Generate classification brackets ---
     num_rounds = len(round_templates)
-    for r in range(num_rounds - 2):   # all rounds before semifinals
+    pools = []
+    for r in range(num_rounds - 2):
         games = round_game_objects[r]
         losers = []
         for g in games:
@@ -311,7 +330,15 @@ def generate_playoffs(path, teams_list, current_games):
                 losers.append(get_loser(g["eval"]))
         if len(losers) >= 2:
             rank_start = 2 ** (num_rounds - r - 1) + 1
-            add_class_bracket(losers, rank_start)
+            pools.append((rank_start, losers))
+    # Sort pools so that the one with highest rank_start (lowest places) is last
+    pools.sort(key=lambda x: x[0], reverse=True)
+    for idx, (rank_start, losers) in enumerate(pools):
+        is_last = (idx == 0)   # first in sorted list is highest rank_start => last place pool
+        add_class_bracket(losers, rank_start, is_last_pool=is_last)
+
+    # Insert all classification games BEFORE the final
+    playoff_structure[-1:-1] = classification_games
 
     # 4. Merge with existing games
     new_list = [g for g in current_games if g.get("phase") != "playoffs"]
